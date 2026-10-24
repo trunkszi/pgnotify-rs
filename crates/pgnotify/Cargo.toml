@@ -1,0 +1,43 @@
+[package]
+name = "pgnotify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["uring", "diesel", "sonic"]
+uring = ["dep:liburing-proactor", "dep:bitflags"]
+diesel = ["dep:diesel"]
+sonic = ["dep:sonic-rs"]
+
+[dependencies]
+pq-sys = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+bitflags = { workspace = true, optional = true }
+liburing-proactor = { workspace = true, optional = true }
+diesel = { workspace = true, optional = true }
+sonic-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+pgnotify-macros = { workspace = true }
+serde = { workspace = true }
+trybuild = { workspace = true }
+criterion = { workspace = true }
+hdrhistogram = { workspace = true }
+
+[[example]]
+name = "proactor_listener"
+required-features = ["uring"]
+
+[[test]]
+name = "postgres_real_table_e2e_tests"
+required-features = ["uring", "diesel", "sonic"]
+
+[[bench]]
+name = "notify_dispatch_bench"
+harness = false
+required-features = ["sonic"]
+
+[lints]
+workspace = true

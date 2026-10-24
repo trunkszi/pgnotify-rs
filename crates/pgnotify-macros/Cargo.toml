@@ -1,0 +1,17 @@
+[package]
+name = "pgnotify-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed PostgreSQL notification payloads and bounded channel dispatch derives."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true, features = ["derive", "full", "parsing", "printing", "proc-macro", "clone-impls"] }
+
+[lints]
+workspace = true

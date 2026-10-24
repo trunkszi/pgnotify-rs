@@ -1,0 +1,28 @@
+error[E0277]: the trait bound `WriteOnly: NotifyPayload` is not satisfied
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_deserialize_contract.rs
+  |
+  |     drop(<WriteOnly as pgnotify::NotifyPayload>::decode_payload(b"{}"));
+  |           ^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `for<'__pgnotify_de> Deserialize<'__pgnotify_de>` is not implemented for `WriteOnly`
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_deserialize_contract.rs
+  |
+  | struct WriteOnly { value: u64 }
+  | ^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `Deserialize<'de>`:
+            &'a Path
+            &'a [u8]
+            &'a str
+            ()
+            (T,)
+            (T0, T1)
+            (T0, T1, T2)
+            (T0, T1, T2, T3)
+          and $N others
+note: required for `WriteOnly` to implement `NotifyPayload`
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_deserialize_contract.rs
+  |
+  | #[derive(Serialize, pgnotify_macros::NotifyPayload)]
+  |                     ------------------------------ type parameter would need to implement `NotifyPayload`
+  | struct WriteOnly { value: u64 }
+  |        ^^^^^^^^^

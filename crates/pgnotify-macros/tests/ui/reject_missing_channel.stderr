@@ -1,0 +1,5 @@
+error: missing #[channel = "name"]
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_missing_channel.rs
+  |
+  | enum Events { Missing }
+  |               ^^^^^^^
