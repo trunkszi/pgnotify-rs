@@ -10,7 +10,7 @@ pub mod raw_conn;
 pub mod types;
 
 pub use channel_table::ChannelTable;
-pub use error::{ListenerState, PgNotifyError, Result, SqlState};
+pub use error::{ListenerPhase, ListenerState, PgNotifyError, Result, SqlState, Superstate};
 pub use fsm::PgListener;
 pub use hook::{NotifyHook, NotifyPayload, NotifyRouter};
 pub use metrics::PgNotifyMetricsSnapshot;

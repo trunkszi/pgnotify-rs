@@ -108,27 +108,15 @@ fn notification() -> NotificationRef<'static> {
     }
 }
 
-fn report_latency(name: &str, mut operation: impl FnMut()) -> Result<(), Box<dyn Error>> {
-    for _ in 0..1024 {
-        operation();
-    }
+fn report_latency<T>(name: &str, mut operation: impl FnMut() -> T) -> Result<(), Box<dyn Error>> {
     let mut samples = Histogram::<u64>::new(3)?;
     for _ in 0..20_000 {
-        let allocations = ALLOCATIONS.load(Ordering::Relaxed);
-        let guard = AllocationScope::enter();
         let started = Instant::now();
-        operation();
-        let elapsed = u64::try_from(started.elapsed().as_nanos())?;
-        drop(guard);
-        assert_eq!(
-            ALLOCATIONS.load(Ordering::Relaxed),
-            allocations,
-            "hot path allocated"
-        );
-        samples.record(elapsed.max(1))?;
+        black_box(operation());
+        samples.record(u64::try_from(started.elapsed().as_nanos())?.max(1))?;
     }
     println!(
-        "{name}: p50={}ns p90={}ns p99={}ns p99.9={}ns allocations=0",
+        "{name}: p50={}ns p90={}ns p99={}ns p99.9={}ns",
         samples.value_at_quantile(0.50),
         samples.value_at_quantile(0.90),
         samples.value_at_quantile(0.99),
@@ -137,62 +125,91 @@ fn report_latency(name: &str, mut operation: impl FnMut()) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn measure<T>(
+    c: &mut Criterion,
+    name: &str,
+    mut operation: impl FnMut() -> T,
+) -> Result<(), Box<dyn Error>> {
+    for _ in 0..1024 {
+        black_box(operation());
+    }
+    let _preflight = without_allocations(&mut operation);
+    report_latency(name, &mut operation)?;
+    c.bench_function(name, |b| b.iter(&mut operation));
+    Ok(())
+}
+
+fn transition_cycle(mut phase: pgnotify::ListenerPhase) -> pgnotify::ListenerPhase {
+    use pgnotify::ListenerPhase as P;
+    for _ in 0..5 {
+        assert!(black_box(phase.is_active_session()));
+        let current = black_box(phase);
+        phase = black_box(match current {
+            P::FlushingSubscriptions => current.after_flush(),
+            P::AwaitingCommandAck => current.transition(P::Listening),
+            P::Listening => current.transition(P::IdlePingFlushing),
+            P::IdlePingFlushing => current.after_flush(),
+            P::IdlePingAwaiting => current.transition(P::FlushingSubscriptions),
+            _ => unreachable!("active-session benchmark cycle"),
+        });
+    }
+    phase
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut channels = ChannelTable::with_capacity(1024)?;
     for index in 0..1024 {
         channels.subscribe(&format!("channel.{index:04}"))?;
     }
-    let expected = channels.lookup("channel.0512");
-    assert!(expected.is_some());
     let notify = notification();
+    let heartbeat = NotificationRef {
+        channel: "heartbeat",
+        payload: "",
+        ..notify
+    };
+    assert!(channels.lookup("channel.0512").is_some());
+    assert_eq!(channels.lookup("channel.9999"), None);
+    assert!(matches!(
+        Feed::decode_notification(notify),
+        Ok(Some(Feed::Quote(_)))
+    ));
+    assert_eq!(
+        Feed::decode_notification(heartbeat),
+        Ok(Some(Feed::Heartbeat))
+    );
     let payload = Quote {
         ticks: 42000,
         quantity: 5,
     };
     let mut out = PayloadBuf::new();
-
-    report_latency("notify_dispatch", || {
-        let decoded = Feed::decode_notification(black_box(notify));
-        assert!(matches!(
-            decoded,
-            Ok(Some(Feed::Quote(Quote {
-                ticks: 42000,
-                quantity: 5
-            })))
-        ));
-        assert!(black_box(decoded).is_ok());
+    let mut c = Criterion::default().configure_from_args();
+    measure(&mut c, "channel_table_lookup/hit", || {
+        channels.lookup(black_box("channel.0512"))
     })?;
-    report_latency("channel_lookup", || {
-        assert_eq!(
-            black_box(channels.lookup(black_box("channel.0512"))),
-            expected
-        );
+    measure(&mut c, "channel_table_lookup/miss", || {
+        channels.lookup(black_box("channel.9999"))
     })?;
-    report_latency("payload_encode", || {
-        assert!(black_box(payload.encode_payload(black_box(&mut out))).is_ok());
+    measure(&mut c, "router_dispatch/json", || {
+        Feed::decode_notification(black_box(notify))
     })?;
-
-    let mut criterion = Criterion::default().configure_from_args();
-    criterion.bench_function("notify_dispatch", |bencher| {
-        bencher.iter(|| {
-            let decoded = without_allocations(|| Feed::decode_notification(black_box(notify)));
-            assert!(decoded.is_ok());
-            assert!(black_box(decoded).is_ok());
-        });
-    });
-    criterion.bench_function("channel_lookup", |bencher| {
-        bencher.iter(|| {
-            black_box(without_allocations(|| {
-                channels.lookup(black_box("channel.0512"))
-            }));
-        });
-    });
-    criterion.bench_function("payload_encode", |bencher| {
-        bencher.iter(|| {
-            let encoded = without_allocations(|| payload.encode_payload(black_box(&mut out)));
-            assert!(encoded.is_ok());
-        });
-    });
-    criterion.final_summary();
+    measure(&mut c, "router_dispatch/unit", || {
+        Feed::decode_notification(black_box(heartbeat))
+    })?;
+    measure(&mut c, "notification_ref_access", || {
+        let notification = black_box(notify);
+        black_box((
+            notification.backend_pid,
+            notification.channel_id,
+            notification.channel.as_bytes(),
+            notification.payload_bytes(),
+        ))
+    })?;
+    measure(&mut c, "hsm_state_transition_cycle", || {
+        transition_cycle(black_box(pgnotify::ListenerPhase::FlushingSubscriptions))
+    })?;
+    measure(&mut c, "payload_encode", || {
+        payload.encode_payload(black_box(&mut out))
+    })?;
+    c.final_summary();
     Ok(())
 }

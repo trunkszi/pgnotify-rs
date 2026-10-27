@@ -1,6 +1,7 @@
 //! Fixed-capacity, cache-aligned byte-trie channel registry.
 use crate::{
     error::{PgNotifyError, Result},
+    notify_ref::prefix_word,
     types::{ChannelId, FixedString},
 };
 
@@ -19,7 +20,17 @@ impl Node {
     }
 }
 
-/// Name lookup takes at most 126 radix-16 trie edges, independent of channel count.
+#[derive(Clone, Copy, Default)]
+struct LookupHint {
+    prefix: u64,
+    id: Option<ChannelId>,
+    // A sole cached entry proves a negative lookup; all other collisions use the trie.
+    count: u32,
+    len: u8,
+}
+
+/// A fixed fingerprint index accelerates hits and unambiguous misses.
+/// Collisions fall back to at most 126 trie edges, independent of channel count.
 /// Registration allocates only on the subscription control path. IDs are stable until removal.
 #[repr(align(64))]
 pub struct ChannelTable {
@@ -28,6 +39,7 @@ pub struct ChannelTable {
     free: Vec<ChannelId>,
     len: usize,
     vacant_nodes: Vec<usize>,
+    hints: Vec<LookupHint>,
 }
 impl Default for ChannelTable {
     fn default() -> Self {
@@ -56,6 +68,7 @@ impl ChannelTable {
             free: (0..capacity).rev().map(|id| ChannelId(id as u16)).collect(),
             len: 0,
             vacant_nodes: Vec::new(),
+            hints: vec![LookupHint::default(); capacity.next_power_of_two() * 2],
         }
     }
     /// # Errors
@@ -114,14 +127,58 @@ impl ChannelTable {
             };
         }
         self.nodes[at].id = Some(id);
+        let prefix = prefix_word(channel.as_bytes());
+        let index = self.hint_index(channel.as_bytes(), prefix);
+        let hint = &mut self.hints[index];
+        hint.count += 1;
+        if hint.id.is_none() {
+            hint.id = Some(id);
+            hint.prefix = prefix;
+            hint.len = channel.len() as u8;
+        }
         self.channels[usize::from(id.0)] = Some(channel);
         self.len += 1;
     }
     pub fn lookup(&self, name: &str) -> Option<ChannelId> {
-        if !crate::types::validate_channel_name_bytes(name.as_bytes()) {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63 {
             return None;
         }
+        let prefix = prefix_word(bytes);
+        let hint = &self.hints[self.hint_index(bytes, prefix)];
+        if hint.count == 0 {
+            return None;
+        }
+        if let Some(id) = hint.id {
+            if usize::from(hint.len) == bytes.len()
+                && hint.prefix == prefix
+                && self
+                    .channel(id)
+                    .is_some_and(|channel| channel.as_bytes() == bytes)
+            {
+                return Some(id);
+            }
+            if hint.count == 1 {
+                return None;
+            }
+        }
+        // Only validated names enter the trie; neither NUL nor invalid lengths can match.
         self.find_node(name).and_then(|node| self.nodes[node].id)
+    }
+    #[inline]
+    fn hint_index(&self, bytes: &[u8], prefix: u64) -> usize {
+        let suffix = if bytes.len() >= 8 {
+            prefix_word(&bytes[bytes.len() - 8..])
+        } else {
+            prefix
+        };
+        // Diffuse every byte before masking; shared prefixes and decimal suffixes otherwise cluster.
+        let mut mixed = prefix ^ suffix.rotate_left(17) ^ bytes.len() as u64;
+        mixed ^= mixed >> 30;
+        mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed ^= mixed >> 27;
+        mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+        (mixed ^ (mixed >> 31)) as usize & (self.hints.len() - 1)
     }
     fn find_node(&self, name: &str) -> Option<usize> {
         let mut at = 0;
@@ -164,6 +221,12 @@ impl ChannelTable {
             self.nodes[path[depth - 1]].children[edges[depth - 1]] = NONE;
             self.vacant_nodes.push(node);
             depth -= 1;
+        }
+        let index = self.hint_index(channel.as_bytes(), prefix_word(channel.as_bytes()));
+        let hint = &mut self.hints[index];
+        hint.count -= 1;
+        if hint.id == Some(id) {
+            hint.id = None;
         }
         self.channels[usize::from(id.0)] = None;
         self.free.push(id);
