@@ -1,7 +1,7 @@
 //! Deterministic, caller-driven listener lifecycle and subscription acknowledgement.
 use crate::{
     channel_table::ChannelTable,
-    error::{ListenerState, PgNotifyError, Result},
+    error::{ListenerPhase, ListenerState, PgNotifyError, Result},
     hook::NotifyHook,
     metrics::PgNotifyMetricsSnapshot,
     options::ListenerOptions,
@@ -34,7 +34,7 @@ pub struct PgListener<H: NotifyHook> {
     metrics: PgNotifyMetricsSnapshot,
     channels: ChannelTable,
     raw: Option<RawPgConn>,
-    state: ListenerState,
+    phase: ListenerPhase,
     epoch: u64,
     socket_generation: u64,
     timer_generation: u64,
@@ -43,8 +43,7 @@ pub struct PgListener<H: NotifyHook> {
     active: Vec<Option<FixedString<64>>>,
     sent: Vec<Option<FixedString<64>>>,
     driving: DriveGuard,
-    replay: bool,
-    continuation: Option<u64>,
+    continuation_generation: u64,
 }
 impl<H: NotifyHook> PgListener<H> {
     /// # Errors
@@ -60,7 +59,7 @@ impl<H: NotifyHook> PgListener<H> {
             channels,
             metrics: PgNotifyMetricsSnapshot::default(),
             raw: None,
-            state: ListenerState::Disconnected,
+            phase: ListenerPhase::Disconnected,
             epoch: 0,
             socket_generation: 0,
             timer_generation: 0,
@@ -71,22 +70,21 @@ impl<H: NotifyHook> PgListener<H> {
             driving: DriveGuard {
                 active: Rc::new(Cell::new(false)),
             },
-            replay: false,
-            continuation: None,
+            continuation_generation: 0,
         })
     }
     /// # Errors
     /// Rejects a second connection, invalid URLs or libpq initialization failures.
     pub fn connect(&mut self, database_url: &str) -> Result<()> {
         self.ensure_mutable()?;
-        if self.state != ListenerState::Disconnected {
+        if self.state() != ListenerState::Disconnected {
             return Err(PgNotifyError::InvalidConfig {
                 reason: "already connected",
             });
         }
         self.raw = Some(RawPgConn::connect(database_url, &self.options)?);
         self.socket_generation += 1;
-        self.state = ListenerState::ConnectingWriting;
+        self.transition(ListenerPhase::ConnectingWriting);
         self.arm(self.options.connect_timeout);
         self.poll_connect(false).or_else(|error| {
             self.fail(error);
@@ -94,7 +92,13 @@ impl<H: NotifyHook> PgListener<H> {
         })
     }
     pub const fn state(&self) -> ListenerState {
-        self.state
+        self.phase.state()
+    }
+    pub const fn phase(&self) -> ListenerPhase {
+        self.phase
+    }
+    fn transition(&mut self, phase: ListenerPhase) {
+        self.phase = self.phase.transition(phase);
     }
     pub const fn epoch(&self) -> u64 {
         self.epoch
@@ -120,8 +124,8 @@ impl<H: NotifyHook> PgListener<H> {
             return Ok(id);
         }
         let id = self.channels.subscribe(channel)?;
-        if self.state == ListenerState::Listening
-            && let Err(error) = self.sync_subscriptions()
+        if self.state() == ListenerState::Listening
+            && let Err(error) = self.sync_subscriptions(false)
         {
             self.fail(error);
             return Err(error);
@@ -139,8 +143,8 @@ impl<H: NotifyHook> PgListener<H> {
                 reason: "unknown channel",
             })?;
         self.channels.remove(id)?;
-        if self.state == ListenerState::Listening
-            && let Err(error) = self.sync_subscriptions()
+        if self.state() == ListenerState::Listening
+            && let Err(error) = self.sync_subscriptions(false)
         {
             self.fail(error);
             return Err(error);
@@ -162,8 +166,8 @@ impl<H: NotifyHook> PgListener<H> {
                     channel,
                 } => {
                     self.channels.register_at(channel, channel_id)?;
-                    if self.state == ListenerState::Listening && self.desired_changed() {
-                        self.sync_subscriptions()?;
+                    if self.state() == ListenerState::Listening && self.desired_changed() {
+                        self.sync_subscriptions(false)?;
                     }
                 }
                 ListenCommand::Unsubscribe { channel_id } => {
@@ -177,7 +181,7 @@ impl<H: NotifyHook> PgListener<H> {
                     self.unsubscribe(channel.as_str())?
                 }
                 ListenCommand::Ping => {
-                    if self.state == ListenerState::Listening {
+                    if self.state() == ListenerState::Listening {
                         self.start_ping()?;
                     }
                 }
@@ -201,7 +205,7 @@ impl<H: NotifyHook> PgListener<H> {
         Ok(count)
     }
     pub fn poll_interest(&self) -> Option<(i32, u64, SocketInterest)> {
-        let interest = match self.state {
+        let interest = match self.state() {
             ListenerState::ConnectingReading | ListenerState::ResettingReading => SocketInterest {
                 readable: true,
                 writable: false,
@@ -240,12 +244,13 @@ impl<H: NotifyHook> PgListener<H> {
                 .is_some_and(|(current, _, _)| current == fd)
     }
     pub const fn timer_deadline(&self) -> Option<TimerDeadline> {
-        match self.continuation {
-            Some(generation) => Some(TimerDeadline {
-                generation,
+        if self.phase.has_continuation() {
+            Some(TimerDeadline {
+                generation: self.continuation_generation,
                 duration: Duration::ZERO,
-            }),
-            None => self.timer,
+            })
+        } else {
+            self.timer
         }
     }
     /// # Errors
@@ -266,21 +271,18 @@ impl<H: NotifyHook> PgListener<H> {
         outcome
     }
     pub fn begin_shutdown(&mut self) {
-        self.state = ListenerState::ShuttingDown;
+        self.transition(ListenerPhase::ShuttingDown);
         self.socket_generation += 1;
         self.cancel_timer();
         self.raw = None;
-        self.state = ListenerState::Terminated;
+        self.transition(ListenerPhase::Terminated);
     }
     pub const fn is_terminated(&self) -> bool {
-        matches!(self.state, ListenerState::Terminated)
+        matches!(self.state(), ListenerState::Terminated)
     }
     fn ensure_mutable(&self) -> Result<()> {
         self.driving.check()?;
-        if matches!(
-            self.state,
-            ListenerState::ShuttingDown | ListenerState::Terminated
-        ) {
+        if self.phase.is_terminating() {
             return Err(PgNotifyError::ShuttingDown);
         }
         Ok(())
@@ -293,8 +295,8 @@ impl<H: NotifyHook> PgListener<H> {
     fn drive(&mut self, event: ListenerEvent) -> Result<usize> {
         match event {
             ListenerEvent::Timer { generation } => {
-                if self.continuation == Some(generation) {
-                    self.continuation = None;
+                if self.phase.has_continuation() && self.continuation_generation == generation {
+                    self.phase = self.phase.without_continuation();
                     return self.continue_buffered();
                 }
                 if self
@@ -304,28 +306,21 @@ impl<H: NotifyHook> PgListener<H> {
                     return Ok(0);
                 }
                 self.cancel_timer();
-                match self.state {
-                    ListenerState::BackoffWait => {
+                if self.phase.is_offline() {
+                    if self.state() == ListenerState::BackoffWait {
                         self.raw_mut()?.reset_start()?;
                         self.socket_generation += 1;
-                        self.state = ListenerState::ResettingWriting;
+                        self.transition(ListenerPhase::ResettingWriting);
                         self.arm(self.options.connect_timeout);
                         self.poll_connect(true)?;
                     }
-                    ListenerState::Listening => self.start_ping()?,
-                    ListenerState::ConnectingReading
-                    | ListenerState::ConnectingWriting
-                    | ListenerState::FlushingSubscriptions
-                    | ListenerState::AwaitingCommandAck
-                    | ListenerState::IdlePingFlushing
-                    | ListenerState::IdlePingAwaiting
-                    | ListenerState::ResettingReading
-                    | ListenerState::ResettingWriting => {
-                        return Err(PgNotifyError::TimedOut { state: self.state });
-                    }
-                    ListenerState::Disconnected
-                    | ListenerState::ShuttingDown
-                    | ListenerState::Terminated => (),
+                } else if self.phase.is_active_session() && self.state() == ListenerState::Listening
+                {
+                    self.start_ping()?;
+                } else if !self.phase.is_terminating() {
+                    return Err(PgNotifyError::TimedOut {
+                        state: self.state(),
+                    });
                 }
                 Ok(0)
             }
@@ -343,15 +338,15 @@ impl<H: NotifyHook> PgListener<H> {
                         phase: "socket readiness",
                     });
                 }
-                match self.state {
-                    ListenerState::ConnectingReading | ListenerState::ConnectingWriting => {
-                        self.poll_connect(false)?;
-                        Ok(0)
-                    }
-                    ListenerState::ResettingReading | ListenerState::ResettingWriting => {
-                        self.poll_connect(true)?;
-                        Ok(0)
-                    }
+                if self.phase.is_handshaking() {
+                    let reset = matches!(
+                        self.state(),
+                        ListenerState::ResettingReading | ListenerState::ResettingWriting
+                    );
+                    self.poll_connect(reset)?;
+                    return Ok(0);
+                }
+                match self.state() {
                     ListenerState::FlushingSubscriptions | ListenerState::IdlePingFlushing => {
                         if readable {
                             self.raw_mut()?.consume()?;
@@ -376,6 +371,10 @@ impl<H: NotifyHook> PgListener<H> {
                     }
                     ListenerState::Disconnected
                     | ListenerState::BackoffWait
+                    | ListenerState::ConnectingReading
+                    | ListenerState::ConnectingWriting
+                    | ListenerState::ResettingReading
+                    | ListenerState::ResettingWriting
                     | ListenerState::ShuttingDown
                     | ListenerState::Terminated => Ok(0),
                 }
@@ -391,18 +390,18 @@ impl<H: NotifyHook> PgListener<H> {
         }
         match status {
             Poll::PGRES_POLLING_READING => {
-                self.state = if reset {
-                    ListenerState::ResettingReading
+                self.transition(if reset {
+                    ListenerPhase::ResettingReading
                 } else {
-                    ListenerState::ConnectingReading
-                }
+                    ListenerPhase::ConnectingReading
+                });
             }
             Poll::PGRES_POLLING_WRITING | Poll::PGRES_POLLING_ACTIVE => {
-                self.state = if reset {
-                    ListenerState::ResettingWriting
+                self.transition(if reset {
+                    ListenerPhase::ResettingWriting
                 } else {
-                    ListenerState::ConnectingWriting
-                }
+                    ListenerPhase::ConnectingWriting
+                });
             }
             Poll::PGRES_POLLING_FAILED => {
                 return Err(PgNotifyError::ConnectionFailed { phase: "handshake" });
@@ -410,15 +409,13 @@ impl<H: NotifyHook> PgListener<H> {
             Poll::PGRES_POLLING_OK => {
                 self.cancel_timer();
                 self.active.fill(None);
-                self.replay = true;
                 self.metrics.connects += 1;
-                self.state = ListenerState::Listening;
-                self.sync_subscriptions()?;
+                self.sync_subscriptions(true)?;
             }
         }
         Ok(())
     }
-    fn sync_subscriptions(&mut self) -> Result<()> {
+    fn sync_subscriptions(&mut self, replay: bool) -> Result<()> {
         // UNLISTEN * makes removal and slot reuse atomic with a single acknowledged desired snapshot.
         let mut sql = String::from("UNLISTEN *;");
         for (_, name) in self.channels.iter() {
@@ -439,17 +436,17 @@ impl<H: NotifyHook> PgListener<H> {
             reason: "channel SQL contains NUL",
         })?;
         self.raw_mut()?.send_query(&sql)?;
-        self.state = ListenerState::FlushingSubscriptions;
+        self.transition(if replay {
+            ListenerPhase::FlushingReplay
+        } else {
+            ListenerPhase::FlushingSubscriptions
+        });
         self.arm(self.options.command_timeout);
         self.flush_query()
     }
     fn flush_query(&mut self) -> Result<()> {
         if self.raw_mut()?.flush()? {
-            self.state = if self.state == ListenerState::IdlePingFlushing {
-                ListenerState::IdlePingAwaiting
-            } else {
-                ListenerState::AwaitingCommandAck
-            };
+            self.phase = self.phase.after_flush();
             self.acknowledge()?;
         }
         Ok(())
@@ -460,17 +457,18 @@ impl<H: NotifyHook> PgListener<H> {
                 QueryProgress::Busy => return Ok(()),
                 QueryProgress::Result => (),
                 QueryProgress::Done => {
-                    let ping = self.state == ListenerState::IdlePingAwaiting;
-                    self.state = ListenerState::Listening;
+                    let ping = self.state() == ListenerState::IdlePingAwaiting;
+                    let replay = self.phase.is_subscription_replay();
+                    self.transition(ListenerPhase::Listening);
                     self.cancel_timer();
                     if !ping {
                         self.apply_subscriptions();
                     }
                     if self.desired_changed() {
-                        self.sync_subscriptions()?;
+                        self.sync_subscriptions(replay)?;
                         return Ok(());
                     }
-                    self.complete_replay();
+                    self.complete_replay(replay);
                     if let Some(interval) = self.options.idle_ping_interval {
                         self.arm(interval);
                     }
@@ -503,13 +501,14 @@ impl<H: NotifyHook> PgListener<H> {
         self.active.copy_from_slice(&self.sent);
     }
     fn request_continuation(&mut self) {
-        if self.continuation.is_none() {
+        if !self.phase.has_continuation() {
             self.timer_generation += 1;
-            self.continuation = Some(self.timer_generation);
+            self.continuation_generation = self.timer_generation;
+            self.phase = self.phase.with_continuation();
         }
     }
     fn continue_buffered(&mut self) -> Result<usize> {
-        match self.state {
+        match self.state() {
             ListenerState::AwaitingCommandAck | ListenerState::IdlePingAwaiting => {
                 self.acknowledge()?
             }
@@ -528,11 +527,10 @@ impl<H: NotifyHook> PgListener<H> {
         }
         self.drain_notifications()
     }
-    fn complete_replay(&mut self) {
-        if self.replay {
+    fn complete_replay(&mut self, replay: bool) {
+        if replay {
             self.epoch += 1;
             self.backoff = self.options.reconnect_initial;
-            self.replay = false;
             let pid = self.raw.as_ref().map_or(0, RawPgConn::backend_pid);
             if self.epoch == 1 {
                 self.hook.on_connected(pid);
@@ -543,7 +541,7 @@ impl<H: NotifyHook> PgListener<H> {
         }
     }
     fn drain_notifications(&mut self) -> Result<usize> {
-        if self.state != ListenerState::Listening {
+        if self.state() != ListenerState::Listening {
             return Ok(0);
         }
         let mut count = 0;
@@ -571,19 +569,19 @@ impl<H: NotifyHook> PgListener<H> {
     fn start_ping(&mut self) -> Result<()> {
         self.raw_mut()?.send_query(c"SELECT 1;")?;
         self.metrics.pings += 1;
-        self.state = ListenerState::IdlePingFlushing;
+        self.transition(ListenerPhase::IdlePingFlushing);
         self.arm(self.options.command_timeout);
         self.flush_query()
     }
     fn fail(&mut self, error: PgNotifyError) {
         let already_driving = self.driving.active.replace(true);
-        self.continuation = None;
+        self.phase = self.phase.without_continuation();
         self.metrics.errors += 1;
         self.metrics.disconnects += 1;
         self.hook.on_error(error);
         self.hook.on_disconnect(self.epoch, error);
         self.socket_generation += 1;
-        self.state = ListenerState::BackoffWait;
+        self.transition(ListenerPhase::BackoffWait);
         self.arm(self.backoff);
         self.backoff = self
             .backoff
@@ -599,7 +597,7 @@ impl<H: NotifyHook> PgListener<H> {
         });
     }
     fn cancel_timer(&mut self) {
-        self.continuation = None;
+        self.phase = self.phase.without_continuation();
         self.timer_generation += 1;
         self.timer = None;
     }

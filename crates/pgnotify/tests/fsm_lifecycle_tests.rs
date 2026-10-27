@@ -425,3 +425,139 @@ fn error_and_disconnect_callbacks_keep_the_reentry_admission_guard_active()
     assert_eq!(listener.hook().results.len(), 2);
     Ok(())
 }
+
+#[test]
+fn replay_survives_continuation_and_resync() -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = MockServer::new()?;
+    server.hold_ack = true;
+    let options = ListenerOptions {
+        notification_budget: 1,
+        ..ListenerOptions::default()
+    };
+    let mut listener = PgListener::new(options, Hook::default())?;
+    assert!(listener.phase().is_offline());
+    listener.subscribe("orders.alpha")?;
+    listener.subscribe("orders.beta")?;
+    listener.connect(&server.url()?)?;
+    until(&mut server, &mut listener, |listener, _| {
+        listener.state() == ListenerState::AwaitingCommandAck
+    })?;
+    assert!(listener.phase().is_active_session());
+    assert!(listener.phase().is_subscription_replay());
+    listener.subscribe("orders.gamma")?;
+    server.release();
+    until(&mut server, &mut listener, |listener, _| {
+        listener.epoch() == 1
+    })?;
+    assert_eq!(server.queries.len(), 2);
+    assert_eq!(
+        listener.hook().events.last().map(String::as_str),
+        Some("connected:1234")
+    );
+    assert!(!listener.phase().is_subscription_replay());
+    server.notify("orders.alpha", "one");
+    server.notify("orders.alpha", "two");
+    server.notify("orders.alpha", "three");
+    until(&mut server, &mut listener, |listener, _| {
+        listener.hook().frames.len() == 1
+    })?;
+    let wake = listener.timer_deadline().ok_or("continuation missing")?;
+    assert_eq!(wake.duration, std::time::Duration::ZERO);
+    // Another socket batch advances the idle deadline without consuming the queued wake.
+    let (fd, _, _) = listener.poll_interest().ok_or("socket missing")?;
+    listener.on_event(ListenerEvent::Socket {
+        fd,
+        readable: false,
+        writable: false,
+        error: false,
+    })?;
+    assert_eq!(listener.hook().frames.len(), 2);
+    assert_eq!(
+        listener
+            .timer_deadline()
+            .ok_or("queued wake missing")?
+            .generation,
+        wake.generation
+    );
+    listener.on_event(ListenerEvent::Timer {
+        generation: wake.generation,
+    })?;
+    assert_eq!(listener.hook().frames.len(), 3);
+    assert_eq!(listener.epoch(), 1);
+    listener.on_event(ListenerEvent::Timer {
+        generation: wake.generation,
+    })?;
+    assert_eq!(listener.hook().frames.len(), 3);
+    listener.begin_shutdown();
+    assert!(listener.phase().is_terminating());
+    assert!(!listener.phase().has_continuation());
+    Ok(())
+}
+
+#[test]
+fn collision_routing_preserves_recycled_ids() -> Result<(), Box<dyn std::error::Error>> {
+    let mut server = MockServer::new()?;
+    let options = ListenerOptions {
+        channel_capacity: 4,
+        ..ListenerOptions::default()
+    };
+    let mut listener = PgListener::new(options, Hook::default())?;
+    // Equal-length names share both edge words, forcing collision fallback to the trie.
+    let names = [
+        "prefix00.alpha.suffix00",
+        "prefix00.bravo.suffix00",
+        "prefix00.cafe.suffix00",
+        "prefix00.a",
+    ];
+    let ids = names
+        .map(|name| listener.subscribe(name))
+        .into_iter()
+        .collect::<pgnotify::Result<Vec<_>>>()?;
+    listener.connect(&server.url()?)?;
+    until(&mut server, &mut listener, |listener, _| {
+        listener.epoch() == 1
+    })?;
+    for name in names {
+        server.notify(name, "first");
+    }
+    until(&mut server, &mut listener, |listener, _| {
+        listener.hook().frames.len() == 4
+    })?;
+    assert_eq!(
+        listener
+            .hook()
+            .frames
+            .iter()
+            .map(|f| f.channel_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    listener.unsubscribe(names[0])?;
+    let recycled = listener.subscribe("prefix00.delta.suffix00")?;
+    assert_eq!(recycled, ids[0]);
+    until(&mut server, &mut listener, |listener, _| {
+        listener.state() == ListenerState::Listening
+    })?;
+    for name in [names[1], "prefix00.delta.suffix00", names[0], names[2]] {
+        server.notify(name, "second");
+    }
+    until(&mut server, &mut listener, |listener, _| {
+        listener.metrics().notifications == 8
+    })?;
+    let frames = &listener.hook().frames;
+    assert_eq!(frames.len(), 7);
+    assert_eq!(frames[4].channel_id, ids[1]);
+    assert_eq!(frames[5].channel_id, recycled);
+    assert_eq!(frames[5].channel.as_str(), "prefix00.delta.suffix00");
+    assert_eq!(frames[6].channel_id, ids[2]);
+    listener.unsubscribe("prefix00.delta.suffix00")?;
+    until(&mut server, &mut listener, |listener, _| {
+        listener.state() == ListenerState::Listening
+    })?;
+    server.notify(names[1], "survivor");
+    until(&mut server, &mut listener, |listener, _| {
+        listener.hook().frames.len() == 8
+    })?;
+    assert_eq!(listener.hook().frames[7].channel_id, ids[1]);
+    Ok(())
+}

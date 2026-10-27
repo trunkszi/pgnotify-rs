@@ -11,11 +11,13 @@ pub struct NotificationRef<'a> {
     pub payload: &'a str,
 }
 impl<'a> NotificationRef<'a> {
+    #[inline(always)]
     pub const fn payload_bytes(&self) -> &'a [u8] {
         self.payload.as_bytes()
     }
     /// # Errors
     /// Rejects unregistered channels, invalid names, and payloads exceeding the frame capacity.
+    #[inline]
     pub fn to_frame<const N: usize>(&self) -> Result<NotifyFrame<N>> {
         let channel_id = self.channel_id.ok_or(PgNotifyError::CodecError {
             reason: "unregistered channel",
@@ -36,5 +38,16 @@ impl<'a> NotificationRef<'a> {
         };
         frame.payload[..self.payload.len()].copy_from_slice(self.payload.as_bytes());
         Ok(frame)
+    }
+}
+
+#[inline]
+pub(crate) fn prefix_word(bytes: &[u8]) -> u64 {
+    if let Some(word) = bytes.first_chunk::<8>() {
+        u64::from_le_bytes(*word)
+    } else {
+        let mut word = [0; 8];
+        word[..bytes.len()].copy_from_slice(bytes);
+        u64::from_le_bytes(word)
     }
 }
