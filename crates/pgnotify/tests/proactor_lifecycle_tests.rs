@@ -201,8 +201,7 @@ fn configured() -> Result<Fixture, Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn notification_and_peer_share_one_ring_and_reject_forged_completions()
--> Result<(), Box<dyn std::error::Error>> {
+fn notification_routes_reject_forged_completions() -> Result<(), Box<dyn std::error::Error>> {
     let (mut server, mut driver, notifications) = configured()?;
     let mut ring = Proactor::builder().entries(16).build()?;
     let peer = OperationId::pack(SubsystemId(2), OperationPayload(1));
@@ -254,8 +253,7 @@ fn notification_and_peer_share_one_ring_and_reject_forged_completions()
 }
 
 #[test]
-fn staged_and_submitted_shutdown_count_cancel_and_target_cqes_independently()
--> Result<(), Box<dyn std::error::Error>> {
+fn shutdown_retires_cancel_and_target_independently() -> Result<(), Box<dyn std::error::Error>> {
     for submitted in [false, true] {
         let (_server, mut driver, _) = configured()?;
         let mut ring = Proactor::new(ProactorConfig {
@@ -301,8 +299,7 @@ fn staged_and_submitted_shutdown_count_cancel_and_target_cqes_independently()
 }
 
 #[test]
-fn zero_budget_retains_pending_io_until_ring_credit_is_released()
--> Result<(), Box<dyn std::error::Error>> {
+fn zero_budget_retains_pending_io() -> Result<(), Box<dyn std::error::Error>> {
     let (_server, mut driver, _) = configured()?;
     let mut ring = Proactor::new(ProactorConfig {
         entries: 2,
@@ -340,5 +337,111 @@ fn zero_budget_retains_pending_io_until_ring_credit_is_released()
 fn reserved_subsystem_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let listener = PgListener::new(Default::default(), Hook)?;
     assert!(ProactorPgListener::new(SubsystemId::INTERNAL, listener).is_err());
+    Ok(())
+}
+
+fn sq_poll_ring() -> Result<Option<Proactor>, Box<dyn std::error::Error>> {
+    let mut mask = vec![0usize; 16];
+    loop {
+        // SAFETY: The initialized aligned mask spans the writable byte extent;
+        // pid zero reads this test thread and no pointer escapes the call.
+        if unsafe {
+            libc::sched_getaffinity(
+                0,
+                std::mem::size_of_val(mask.as_slice()),
+                mask.as_mut_ptr().cast(),
+            )
+        } == 0
+        {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINVAL) || mask.len() >= 1 << 14 {
+            return Err(error.into());
+        }
+        mask.resize(mask.len() * 2, 0);
+    }
+    let allowed: u32 = mask.iter().map(|word| word.count_ones()).sum();
+    let cpu = mask
+        .iter()
+        .enumerate()
+        .find_map(|(index, word)| {
+            (*word != 0)
+                .then_some((index * usize::BITS as usize + word.trailing_zeros() as usize) as u32)
+        })
+        .ok_or("empty allowed CPU mask")?;
+    let result = Proactor::builder()
+        .entries(16)
+        .sq_poll(liburing::SqPollConfig::pinned(cpu))
+        .build();
+    match result {
+        Ok(ring) => Ok(Some(ring)),
+        Err(liburing::UringError::RingInit(errno))
+            if matches!(
+                errno.abs(),
+                libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EINVAL
+            ) =>
+        {
+            eprintln!("SKIP SQPOLL lifecycle: ring setup errno {errno}");
+            Ok(None)
+        }
+        Err(error @ liburing::UringError::InvalidConfig(_)) if allowed == 1 => {
+            eprintln!("SKIP SQPOLL lifecycle: sole allowed owner CPU: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[test]
+fn sq_poll_notifies_and_drains_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut ring) = sq_poll_ring()? else {
+        return Ok(());
+    };
+    let (mut server, mut driver, notifications) = configured()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut sent = false;
+    while notifications.borrow().is_empty() {
+        assert!(Instant::now() < deadline, "SQPOLL notification timed out");
+        server.pump()?;
+        if driver.listener.state() == ListenerState::Listening && !sent {
+            server.notify("sq-poll delivered")?;
+            sent = true;
+        }
+        driver.flush(&mut ring)?;
+        ring.tick(&mut driver)?;
+        std::hint::spin_loop();
+    }
+    assert_eq!(&*notifications.borrow(), &["sq-poll delivered"]);
+    driver.flush(&mut ring)?;
+    ring.submit()?;
+    assert!(
+        driver.has_pending_io(),
+        "shutdown must retire actual pending I/O"
+    );
+    let waits = ring.stats().wait_calls;
+    driver.shutdown_within(&mut ring, Duration::from_secs(3))?;
+    assert!(!driver.has_pending_io());
+    assert_eq!(driver.inflight_count(), 0);
+    assert_eq!(ring.operation_count(), 0);
+    assert_eq!(ring.stats().wait_calls, waits);
+    let peer = OperationId::pack(SubsystemId(2), OperationPayload(9));
+    ring.alloc_sqe(peer)?;
+    let mut seen = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !seen {
+        assert!(
+            Instant::now() < deadline,
+            "shared ring became unusable after shutdown"
+        );
+        ring.tick(&mut |cqe: Completion, _: &mut SubmissionContext<'_>| {
+            assert_eq!(cqe.operation_id, peer);
+            assert_eq!(cqe.result, 0);
+            seen = true;
+            Ok(())
+        })?;
+        std::hint::spin_loop();
+    }
+    ring.shutdown()?;
     Ok(())
 }

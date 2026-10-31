@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 pq-sys = { version = "=0.7.6", default-features = false, features = ["bundled_without_openssl"] }
 diesel = { version = "=2.3.14", default-features = false, features = ["postgres", "r2d2", "32-column-tables"] }
 sonic-rs = { version = "0.5", default-features = false }
-liburing-proactor = { version = "=0.0.1", default-features = false }
+liburing-proactor = { git = "https://github.com/trunkszi/liburing-rs.git", branch = "main", default-features = false }
 thiserror = { version = "2", default-features = false }
 libc = { version = "0.2", default-features = false }
 bitflags = { version = "2", default-features = false }
