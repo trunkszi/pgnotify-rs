@@ -452,9 +452,8 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "liburing-proactor"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d135ca94fe93bd1b997ae72520afdfd6079410b870ce71c499e76099cbb9a28b"
+version = "0.0.2"
+source = "git+https://github.com/trunkszi/liburing-rs.git?branch=main#69e1c5a25e404f37f467333a6578b5034f1d3ee6"
 dependencies = [
  "io-uring",
  "libc",

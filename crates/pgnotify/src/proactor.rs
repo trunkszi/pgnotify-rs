@@ -161,8 +161,13 @@ impl<H: NotifyHook> ProactorPgListener<H> {
                 });
             }
             self.flush(ring)?;
-            ring.wait_completions(1, Some(remaining.min(Duration::from_millis(20))), self)
-                .map_err(map_ring_error)?;
+            if ring.mode().allows_blocking_wait() {
+                ring.wait_completions(1, Some(remaining.min(Duration::from_millis(20))), self)
+                    .map_err(map_ring_error)?;
+            } else {
+                ring.tick(self).map_err(map_ring_error)?;
+                std::hint::spin_loop();
+            }
         }
         Ok(())
     }
@@ -443,6 +448,11 @@ fn map_ring_error(error: UringError) -> PgNotifyError {
         | UringError::Wait(errno)
         | UringError::Syscall { errno, .. } => errno,
         UringError::SqRingFull => libc::EAGAIN,
+        UringError::CompletionsDropped => libc::EOVERFLOW,
+        UringError::SqThreadGone => libc::EPIPE,
+        UringError::OpcodeNotAdmitted { .. }
+        | UringError::BlockingWaitUnavailable { .. }
+        | UringError::CancellationUnavailable { .. } => libc::EOPNOTSUPP,
         _ => libc::EINVAL,
     };
     PgNotifyError::IoError {
@@ -492,3 +502,38 @@ macro_rules! impl_submit {
 }
 impl_submit!(Proactor);
 impl_submit!(SubmissionContext<'_>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_errors_keep_specific_errno() {
+        for (error, expected) in [
+            (UringError::CompletionsDropped, libc::EOVERFLOW),
+            (UringError::SqThreadGone, libc::EPIPE),
+            (
+                UringError::OpcodeNotAdmitted {
+                    opcode: 0,
+                    mode: "io-poll",
+                },
+                libc::EOPNOTSUPP,
+            ),
+            (
+                UringError::BlockingWaitUnavailable { mode: "sq-poll" },
+                libc::EOPNOTSUPP,
+            ),
+            (
+                UringError::CancellationUnavailable { mode: "io-poll" },
+                libc::EOPNOTSUPP,
+            ),
+        ] {
+            assert!(
+                matches!(map_ring_error(error), PgNotifyError::IoError {
+                op: "PostgreSQL proactor", errno,
+            } if errno == expected),
+                "incorrect mapping for {error}"
+            );
+        }
+    }
+}
