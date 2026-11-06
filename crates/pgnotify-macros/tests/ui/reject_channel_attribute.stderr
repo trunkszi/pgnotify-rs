@@ -1,0 +1,5 @@
+error: expected #[channel = "name"]
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_channel_attribute.rs
+  |
+  |     #[channel("name")]
+  |     ^^^^^^^^^^^^^^^^^^

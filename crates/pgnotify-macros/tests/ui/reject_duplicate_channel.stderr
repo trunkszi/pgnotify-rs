@@ -1,0 +1,5 @@
+error: duplicate channel name
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_duplicate_channel.rs
+  |
+  |     #[channel = "same"]
+  |                 ^^^^^^

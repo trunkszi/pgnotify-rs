@@ -1,0 +1,5 @@
+error: expected a unit or single-field variant
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_variant_shape.rs
+  |
+  |     Pair(u32, u32),
+  |         ^^^^^^^^^^

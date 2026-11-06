@@ -1,0 +1,5 @@
+error: channel must contain 1..=63 UTF-8 bytes without NUL
+ --> $WORKSPACE/crates/pgnotify-macros/tests/ui/reject_long_channel.rs
+  |
+  |     #[channel = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
